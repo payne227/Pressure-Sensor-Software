@@ -74,6 +74,7 @@ def wait_drdy(i, timeout_ms=100):
     return True
 
 def read_data(i):
+
     cs_low(i)
 
     spi.write(bytearray([CMD_RDATA]))
@@ -97,10 +98,12 @@ def read_data(i):
 # ADS1256 INITIALIZATION
 # ------------------------------------------------------------
 def init_ads1256(i):
+
     try:
+
         write_reg(i, 0x00, 0x01)  # STATUS
         write_reg(i, 0x01, 0x00)  # MUX
-        write_reg(i, 0x02, 0x03)  # ADCON gain=1
+        write_reg(i, 0x02, 0x03)  # ADCON gain = 1
         write_reg(i, 0x03, 0xF0)  # 1000 SPS
 
         write_cmd(i, CMD_SYNC)
@@ -112,10 +115,11 @@ def init_ads1256(i):
         return False
 
 # ------------------------------------------------------------
-# SET INPUT CHANNEL
+# CHANNEL SELECT
 # ------------------------------------------------------------
 def set_channel(i, ch):
-    mux = (ch << 4) | 0x08
+
+    mux = (ch << 4) | 0x08  # AINx vs AINCOM
 
     write_reg(i, 0x01, mux)
 
@@ -123,7 +127,7 @@ def set_channel(i, ch):
     write_cmd(i, CMD_WAKEUP)
 
 # ------------------------------------------------------------
-# READ ALL 8 CHANNELS FROM ONE ADC
+# READ ALL CHANNELS OF ONE ADC
 # ------------------------------------------------------------
 def read_all_channels(i):
 
@@ -132,6 +136,7 @@ def read_all_channels(i):
     for ch in range(8):
 
         try:
+
             set_channel(i, ch)
 
             if not wait_drdy(i):
@@ -139,15 +144,17 @@ def read_all_channels(i):
                 continue
 
             value = read_data(i)
+
             readings.append(value)
 
         except Exception:
+
             readings.append(0)
 
     return readings
 
 # ------------------------------------------------------------
-# INITIALIZE ALL ADCS
+# INITIALIZE ADCS
 # ------------------------------------------------------------
 adc_active = []
 
@@ -164,33 +171,49 @@ for adc in range(4):
     else:
         print("ADC{} OFFLINE".format(adc))
 
+print("Starting acquisition...")
+
 # ------------------------------------------------------------
-# MAIN LOOP
+# SENSOR MAPPING
 #
-# PC PROGRAM EXPECTS:
-# Results: [8 integers]
+# Total sensors used: 30
 #
-# We are currently using ADC0 as the 8-channel source for
-# the heatmap application.
+# ADC0 CH0-7  -> Sensors 1-8
+# ADC1 CH0-7  -> Sensors 9-16
+# ADC2 CH0-7  -> Sensors 17-24
+# ADC3 CH0-5  -> Sensors 25-30
+#
+# ADC3 CH6-7 are unused
 # ------------------------------------------------------------
+
 while True:
 
     try:
 
-        if adc_active[0]:
+        all_readings = []
 
-            readings = read_all_channels(0)
+        for adc in range(4):
 
-            if len(readings) != 8:
-                readings = [0] * 8
+            if adc_active[adc]:
+                values = read_all_channels(adc)
+            else:
+                values = [0] * 8
 
-        else:
-            readings = [0] * 8
+            all_readings.extend(values)
 
-        print("Results:", readings)
+        # Remove unused channels:
+        # ADC3 CH6 and CH7
+        all_readings = all_readings[:30]
+
+        if len(all_readings) != 30:
+            all_readings = [0] * 30
+
+        # PC heatmap parser expects:
+        # Results: [30 integers]
+        print("Results:", all_readings)
 
     except Exception:
 
-        print("Results:", [0,0,0,0,0,0,0,0])
+        print("Results:", [0] * 30)
 
     time.sleep(0.05)
