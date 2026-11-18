@@ -39,11 +39,11 @@ DRDY_PINS = [
 # ------------------------------------------------------------
 # ADS1256 COMMANDS
 # ------------------------------------------------------------
-CMD_WREG = 0x50
-CMD_RREG = 0x10
-CMD_SYNC = 0xFC
+CMD_WREG   = 0x50
+CMD_RREG   = 0x10
+CMD_SYNC   = 0xFC
 CMD_WAKEUP = 0x00
-CMD_RDATA = 0x01
+CMD_RDATA  = 0x01
 
 # ------------------------------------------------------------
 # LOW-LEVEL SPI HELPERS
@@ -54,9 +54,19 @@ def cs_low(i):
 def cs_high(i):
     CS_PINS[i].value(1)
 
-def wait_drdy(i):
+def wait_drdy(i, timeout_ms=100):
+    """
+    Wait for DRDY to go low.
+    Returns True if conversion ready.
+    Returns False if timeout occurs.
+    """
+    start = time.ticks_ms()
+
     while DRDY_PINS[i].value() == 1:
-        pass
+        if time.ticks_diff(time.ticks_ms(), start) >= timeout_ms:
+            return False
+
+    return True
 
 def write_cmd(i, cmd):
     cs_low(i)
@@ -86,21 +96,31 @@ def read_data(i):
 # CONFIGURE EACH ADS1256
 # ------------------------------------------------------------
 def init_ads1256(i):
-    write_reg(i, 0x00, 0x01)  # STATUS: disable buffer
-    write_reg(i, 0x01, 0x00)  # MUX: AIN0/AINCOM
-    write_reg(i, 0x02, 0x03)  # ADCON: gain=1
-    write_reg(i, 0x03, 0xF0)  # DRATE: 1000 SPS
-    write_cmd(i, CMD_SYNC)
-    write_cmd(i, CMD_WAKEUP)
 
-for i in range(4):
-    init_ads1256(i)
+    try:
+        write_reg(i, 0x00, 0x01)  # STATUS: buffer off
+        write_reg(i, 0x01, 0x00)  # MUX: AIN0/AINCOM
+        write_reg(i, 0x02, 0x03)  # ADCON: gain=1
+        write_reg(i, 0x03, 0xF0)  # DRATE: 1000 SPS
+
+        write_cmd(i, CMD_SYNC)
+        write_cmd(i, CMD_WAKEUP)
+
+        if wait_drdy(i):
+            return True
+        else:
+            return False
+
+    except Exception as e:
+        print("ADC", i, "init exception:", e)
+        return False
 
 # ------------------------------------------------------------
 # SET INPUT CHANNEL
 # ------------------------------------------------------------
 def set_channel(i, ch):
     mux = (ch << 4) | 0x08  # AINx vs AINCOM
+
     write_reg(i, 0x01, mux)
     write_cmd(i, CMD_SYNC)
     write_cmd(i, CMD_WAKEUP)
@@ -109,22 +129,60 @@ def set_channel(i, ch):
 # READ ALL 8 CHANNELS FROM ONE ADC
 # ------------------------------------------------------------
 def read_all_channels(i):
+
     results = []
+
     for ch in range(8):
+
         set_channel(i, ch)
-        wait_drdy(i)
+
+        if not wait_drdy(i):
+            print("ADC", i, "timeout on channel", ch)
+            results.append(None)
+            continue
+
         val = read_data(i)
         results.append(val)
+
     return results
 
 # ------------------------------------------------------------
-# MAIN LOOP: READ ALL 4 ADCs
+# INITIALIZE ADCs
+# ------------------------------------------------------------
+adc_active = []
+
+print("Initializing ADS1256 modules...")
+
+for i in range(4):
+
+    if init_ads1256(i):
+        print("ADC", i, "ONLINE")
+        adc_active.append(True)
+    else:
+        print("ADC", i, "OFFLINE")
+        adc_active.append(False)
+
+print()
+
+# ------------------------------------------------------------
+# MAIN LOOP
 # ------------------------------------------------------------
 while True:
+
     all_data = []
 
     for adc in range(4):
-        ch_data = read_all_channels(adc)
+
+        if adc_activech_data = read_all_channels(adc)
+
+            # If every channel timed out, mark ADC offline
+            if all(v is None for v in ch_data):
+                print("ADC", adc, "lost communication")
+                adc_active[adc] = False
+                ch_data = ["OFFLINE"] * 8
+        else:
+            ch_data = ["OFFLINE"] * 8
+
         all_data.append(ch_data)
 
     print("ADC0:", all_data[0])
