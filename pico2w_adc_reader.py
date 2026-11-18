@@ -2,7 +2,7 @@ from machine import Pin, SPI
 import time
 
 # ------------------------------------------------------------
-# SPI SETUP (shared by all 4 ADS1256 modules)
+# SPI SETUP (shared by all ADS1256 modules)
 # ------------------------------------------------------------
 spi = SPI(
     0,
@@ -17,23 +17,23 @@ spi = SPI(
 )
 
 # ------------------------------------------------------------
-# CHIP SELECT PINS (one per ADC)
+# CHIP SELECT PINS
 # ------------------------------------------------------------
 CS_PINS = [
-    Pin(17, Pin.OUT, value=1),  # ADC 0
-    Pin(14, Pin.OUT, value=1),  # ADC 1
-    Pin(13, Pin.OUT, value=1),  # ADC 2
-    Pin(12, Pin.OUT, value=1)   # ADC 3
+    Pin(17, Pin.OUT, value=1),  # ADC0
+    Pin(14, Pin.OUT, value=1),  # ADC1
+    Pin(13, Pin.OUT, value=1),  # ADC2
+    Pin(12, Pin.OUT, value=1)   # ADC3
 ]
 
 # ------------------------------------------------------------
-# DRDY PINS (one per ADC)
+# DRDY PINS
 # ------------------------------------------------------------
 DRDY_PINS = [
-    Pin(20, Pin.IN),  # ADC 0
-    Pin(21, Pin.IN),  # ADC 1
-    Pin(22, Pin.IN),  # ADC 2
-    Pin(26, Pin.IN)   # ADC 3
+    Pin(20, Pin.IN),  # ADC0
+    Pin(21, Pin.IN),  # ADC1
+    Pin(22, Pin.IN),  # ADC2
+    Pin(26, Pin.IN)   # ADC3
 ]
 
 # ------------------------------------------------------------
@@ -46,27 +46,13 @@ CMD_WAKEUP = 0x00
 CMD_RDATA  = 0x01
 
 # ------------------------------------------------------------
-# LOW-LEVEL SPI HELPERS
+# SPI HELPERS
 # ------------------------------------------------------------
 def cs_low(i):
     CS_PINS[i].value(0)
 
 def cs_high(i):
     CS_PINS[i].value(1)
-
-def wait_drdy(i, timeout_ms=100):
-    """
-    Wait for DRDY to go low.
-    Returns True if conversion ready.
-    Returns False if timeout occurs.
-    """
-    start = time.ticks_ms()
-
-    while DRDY_PINS[i].value() == 1:
-        if time.ticks_diff(time.ticks_ms(), start) >= timeout_ms:
-            return False
-
-    return True
 
 def write_cmd(i, cmd):
     cs_low(i)
@@ -78,50 +64,61 @@ def write_reg(i, reg, value):
     spi.write(bytearray([CMD_WREG | reg, 0x00, value]))
     cs_high(i)
 
+def wait_drdy(i, timeout_ms=100):
+    start = time.ticks_ms()
+
+    while DRDY_PINS[i].value() == 1:
+        if time.ticks_diff(time.ticks_ms(), start) >= timeout_ms:
+            return False
+
+    return True
+
 def read_data(i):
     cs_low(i)
+
     spi.write(bytearray([CMD_RDATA]))
     time.sleep_us(10)
+
     raw = spi.read(3)
+
     cs_high(i)
 
-    val = (raw[0] << 16) | (raw[1] << 8) | raw[2]
+    if raw is None or len(raw) != 3:
+        raise RuntimeError("SPI read failed")
 
-    if val & 0x800000:
-        val -= 0x1000000
+    value = (raw[0] << 16) | (raw[1] << 8) | raw[2]
 
-    return val
+    if value & 0x800000:
+        value -= 0x1000000
+
+    return value
 
 # ------------------------------------------------------------
-# CONFIGURE EACH ADS1256
+# ADS1256 INITIALIZATION
 # ------------------------------------------------------------
 def init_ads1256(i):
-
     try:
-        write_reg(i, 0x00, 0x01)  # STATUS: buffer off
-        write_reg(i, 0x01, 0x00)  # MUX: AIN0/AINCOM
-        write_reg(i, 0x02, 0x03)  # ADCON: gain=1
-        write_reg(i, 0x03, 0xF0)  # DRATE: 1000 SPS
+        write_reg(i, 0x00, 0x01)  # STATUS
+        write_reg(i, 0x01, 0x00)  # MUX
+        write_reg(i, 0x02, 0x03)  # ADCON gain=1
+        write_reg(i, 0x03, 0xF0)  # 1000 SPS
 
         write_cmd(i, CMD_SYNC)
         write_cmd(i, CMD_WAKEUP)
 
-        if wait_drdy(i):
-            return True
-        else:
-            return False
+        return wait_drdy(i)
 
-    except Exception as e:
-        print("ADC", i, "init exception:", e)
+    except Exception:
         return False
 
 # ------------------------------------------------------------
 # SET INPUT CHANNEL
 # ------------------------------------------------------------
 def set_channel(i, ch):
-    mux = (ch << 4) | 0x08  # AINx vs AINCOM
+    mux = (ch << 4) | 0x08
 
     write_reg(i, 0x01, mux)
+
     write_cmd(i, CMD_SYNC)
     write_cmd(i, CMD_WAKEUP)
 
@@ -130,65 +127,70 @@ def set_channel(i, ch):
 # ------------------------------------------------------------
 def read_all_channels(i):
 
-    results = []
+    readings = []
 
     for ch in range(8):
 
-        set_channel(i, ch)
+        try:
+            set_channel(i, ch)
 
-        if not wait_drdy(i):
-            print("ADC", i, "timeout on channel", ch)
-            results.append(None)
-            continue
+            if not wait_drdy(i):
+                readings.append(0)
+                continue
 
-        val = read_data(i)
-        results.append(val)
+            value = read_data(i)
+            readings.append(value)
 
-    return results
+        except Exception:
+            readings.append(0)
+
+    return readings
 
 # ------------------------------------------------------------
-# INITIALIZE ADCs
+# INITIALIZE ALL ADCS
 # ------------------------------------------------------------
 adc_active = []
 
 print("Initializing ADS1256 modules...")
 
-for i in range(4):
+for adc in range(4):
 
-    if init_ads1256(i):
-        print("ADC", i, "ONLINE")
-        adc_active.append(True)
+    online = init_ads1256(adc)
+
+    adc_active.append(online)
+
+    if online:
+        print("ADC{} ONLINE".format(adc))
     else:
-        print("ADC", i, "OFFLINE")
-        adc_active.append(False)
-
-print()
+        print("ADC{} OFFLINE".format(adc))
 
 # ------------------------------------------------------------
 # MAIN LOOP
+#
+# PC PROGRAM EXPECTS:
+# Results: [8 integers]
+#
+# We are currently using ADC0 as the 8-channel source for
+# the heatmap application.
 # ------------------------------------------------------------
 while True:
 
-    all_data = []
+    try:
 
-    for adc in range(4):
+        if adc_active[0]:
 
-        if adc_activech_data = read_all_channels(adc)
+            readings = read_all_channels(0)
 
-            # If every channel timed out, mark ADC offline
-            if all(v is None for v in ch_data):
-                print("ADC", adc, "lost communication")
-                adc_active[adc] = False
-                ch_data = ["OFFLINE"] * 8
+            if len(readings) != 8:
+                readings = [0] * 8
+
         else:
-            ch_data = ["OFFLINE"] * 8
+            readings = [0] * 8
 
-        all_data.append(ch_data)
+        print("Results:", readings)
 
-    print("ADC0:", all_data[0])
-    print("ADC1:", all_data[1])
-    print("ADC2:", all_data[2])
-    print("ADC3:", all_data[3])
-    print("--------------------------------------------------")
+    except Exception:
 
-    time.sleep(0.5)
+        print("Results:", [0,0,0,0,0,0,0,0])
+
+    time.sleep(0.05)
