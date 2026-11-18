@@ -1,9 +1,16 @@
-"""PC heatmap for one Pico sensor. Run SensorTest.py as main.py on the Pico.
+"""PC heatmap for four sensors. Run 1ADC4Chan_Test.py as main.py on the Pico.
+
+USB format: Results: [AIN0, AIN1, AIN2, AIN3], one complete scan per line.
+Grid: AIN0/AIN1 on the top row, AIN2/AIN3 on the bottom row.
+Legacy CH0: through CH3: scans are also accepted in that order.
+Positive ADC counts are scaled to 0..65536; negative counts display as zero.
+The original signed ADC counts remain visible for troubleshooting.
 
 Install PC dependencies: python -m pip install numpy matplotlib pyserial
 Close Thonny's serial connection before connecting here.
 """
 
+import json
 import tkinter as tk
 from tkinter import ttk
 from time import monotonic
@@ -16,13 +23,16 @@ from matplotlib.figure import Figure
 
 
 class ForceMapApp:
-    ROWS = 1
-    COLS = 1
-    UPDATE_MS = 200
+    ROWS = 2
+    COLS = 4
+    RAW_MIN = -(1 << 23)
+    RAW_MAX = (1 << 23) - 1
+    DISPLAY_MAX = 65536
+    UPDATE_MS = 1
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Live FSR01 Sensor — GP27")
+        self.root.title("Live 2×4 Sensor Heat Map — ADS1256")
         self.running = True
         self.pending_update = None
         self.connection = None
@@ -30,6 +40,7 @@ class ForceMapApp:
         self.connected_at = None
         self.last_reading_at = None
         self.received_bytes = 0
+        self.channel_scan = []
 
         controls = ttk.Frame(root)
         controls.pack(fill=tk.X, padx=8, pady=8)
@@ -55,24 +66,32 @@ class ForceMapApp:
             np.full((self.ROWS, self.COLS), np.nan),
             cmap="inferno",
             vmin=0,
-            vmax=65535,
+            vmax=self.DISPLAY_MAX,
             interpolation="nearest",
             origin="upper",
         )
 
         axes.set(
-            title="FSR01 — GP27",
+            title="2×4 Sensor Readings — ADS1256",
             xticks=range(self.COLS),
             yticks=range(self.ROWS),
             xticklabels=range(1, self.COLS + 1),
             yticklabels=range(1, self.ROWS + 1),
         )
-        self.reading_text = axes.text(
-            0, 0, "Waiting for data", ha="center", va="center", color="white",
-            bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"),
-        )
+        self.reading_texts = [
+            axes.text(
+                ch % self.COLS, ch // self.COLS,
+                "AIN{}\nWaiting for data".format(ch),
+                ha="center", va="center", color="white",
+                bbox=dict(facecolor="black", alpha=0.6, edgecolor="none"),
+            )
+            for ch in range(self.ROWS * self.COLS)
+        ]
 
-        figure.colorbar(self.heatmap, ax=axes, label="Raw sensor reading")
+        figure.colorbar(
+            self.heatmap, ax=axes, label="Sensor level (scaled 0–65536)",
+            ticks=[0, 16384, 32768, 49152, 65536],
+        )
         figure.tight_layout()
 
         self.canvas = FigureCanvasTkAgg(figure, master=root)
@@ -97,6 +116,7 @@ class ForceMapApp:
             self.connection.close()
             self.connection = None
         self.receive_buffer = b""
+        self.channel_scan = []
         self.connected_at = None
         self.connect_button.config(text="Connect")
 
@@ -115,39 +135,75 @@ class ForceMapApp:
             self.status.set("Could not connect: {}. Close Thonny's connection.".format(error))
             return
         self.receive_buffer = b""
+        self.channel_scan = []
         self.connected_at = monotonic()
         self.last_reading_at = None
         self.received_bytes = 0
         self.serial_preview.set("USB data: none received")
         self.connect_button.config(text="Disconnect")
-        self.status.set("Connected to {}. Waiting for Raw: readings...".format(self.port.get()))
+        self.status.set("Connected to {}. Waiting for four-channel scans...".format(self.port.get()))
+
+    @classmethod
+    def scale_reading(cls, raw):
+        """Unipolar display scale; preserve signed counts separately for diagnosis."""
+        return round(max(0, min(raw, cls.RAW_MAX)) * cls.DISPLAY_MAX / cls.RAW_MAX)
 
     def read_sensors(self):
-        """Return the newest complete Raw: reading, or None if none arrived."""
+        """Return the newest complete four-channel scan, or None if none arrived."""
         if self.connection is None:
             return None
         chunk = self.connection.read(min(self.connection.in_waiting, 4096))
         if chunk:
             self.received_bytes += len(chunk)
             self.serial_preview.set(
-                "Latest USB data: " + repr(chunk.decode("utf-8", errors="replace")[-200:])
-            )
+                "Latest USB data: " + repr(chunk.decode("utf-8", errors="replace")[-200:]))
         self.receive_buffer += chunk
         lines = self.receive_buffer.split(b"\n")
         self.receive_buffer = lines.pop()
         if len(self.receive_buffer) > 4096:
             self.receive_buffer = b""
+            self.channel_scan = []
         latest = None
         for line in lines:
             text = line.decode("utf-8", errors="replace").strip()
-            if not text.startswith("Raw:"):
+            if text.startswith("CH"):
+                # Only publish consecutive CH0, CH1, CH2, CH3 from one scan.
+                try:
+                    label, number = text.split(":", 1)
+                    ch = int(label[2:])
+                    value = int(number.strip())
+                except ValueError:
+                    self.channel_scan = []
+                    continue
+                if ch == 0:
+                    self.channel_scan = []
+                if (
+                    ch == len(self.channel_scan) and 0 <= ch < 8
+                    and self.RAW_MIN <= value <= self.RAW_MAX
+                ):
+                    self.channel_scan.append(value)
+                    if len(self.channel_scan) == 8:
+                        latest = self.channel_scan
+                        self.channel_scan = []
+                else:
+                    self.channel_scan = []
+                continue
+            self.channel_scan = []
+            if not text.startswith("Results:"):
                 continue
             try:
-                raw = int(text.split(":", 1)[1].split()[0])
-            except (ValueError, IndexError):
+                values = json.loads(text.split(":", 1)[1])
+            except ValueError:
                 continue
-            if 0 <= raw <= 65535:
-                latest = raw
+            if (
+                isinstance(values, list)
+                and len(values) == self.ROWS * self.COLS
+                and all(
+                    type(value) is int and self.RAW_MIN <= value <= self.RAW_MAX
+                    for value in values
+                )
+            ):
+                latest = values
         return latest
 
     def update_heatmap(self):
@@ -172,34 +228,37 @@ class ForceMapApp:
                     self.status.set("Readings stopped. Display holds the last value. Check the Pico script.")
                 elif not self.received_bytes:
                     self.status.set(
-                        "Port open, but the Pico is sending no data. Save SensorTest.py as "
+                        "Port open, but the Pico is sending no data. Save 1ADC4Chan_Test.py as "
                         "main.py on the Pico, close Thonny, and restart the Pico."
                     )
                 else:
                     self.status.set(
-                        "USB data received, but no valid Raw: readings. Check Latest USB data "
+                        "USB data received, but no complete Results: or CH0–CH3 scan. Check Latest USB data "
                         "below for a MicroPython prompt or an error."
                     )
         if self.running and readings is not None:
-            voltage = readings * 3.3 / 65535
-            self.heatmap.set_data([[readings]])
-            self.reading_text.set_text("Raw: {}\n{:.3f} V".format(readings, voltage))
+            levels = [self.scale_reading(value) for value in readings]
+            self.heatmap.set_data(np.asarray(levels).reshape(self.ROWS, self.COLS))
+            for ch, (value, level) in enumerate(zip(readings, levels)):
+                self.reading_texts[ch].set_text(
+                    "AIN{}\nLevel: {}\nADC: {}".format(ch, level, value)
+                )
             self.canvas.draw_idle()
 
         # Schedule the next refresh without blocking Tkinter's event loop.
-        self.pending_update = self.root.after(
-            self.UPDATE_MS, self.update_heatmap
-        )
+        self.pending_update = self.root.after(self.UPDATE_MS, self.update_heatmap)
 
     def toggle_running(self):
         self.running = not self.running
         self.pause_button.config(text="Pause" if self.running else "Resume")
+        # This code is what allows the program to run or stop when the pause button is hit
 
     def close(self):
         if self.pending_update is not None:
             self.root.after_cancel(self.pending_update)
         self.disconnect()
         self.root.destroy()
+        # This is the Code that defines/programs the close button for the heat map
 
 
 if __name__ == "__main__":
